@@ -520,9 +520,123 @@ func (p *BedrockProvider) CompleteStream(ctx context.Context, req *models.ChatCo
 		}
 
 		// For live AWS Bedrock SigV4 request:
-		// ConverseStream endpoint
-		// Format: POST https://bedrock-runtime.{region}.amazonaws.com/model/{modelID}/converse-stream
-		// (In production, signed via AWS SigV4)
+		endpoint := fmt.Sprintf("https://bedrock-runtime.%s.amazonaws.com/model/%s/converse-stream", p.region, p.modelID)
+
+		type bedrockConverseMessage struct {
+			Role    string                   `json:"role"`
+			Content []map[string]interface{} `json:"content"`
+		}
+
+		var bMessages []bedrockConverseMessage
+		for _, m := range req.Messages {
+			role := "user"
+			if m.Role == models.RoleAssistant {
+				role = "assistant"
+			}
+			bMessages = append(bMessages, bedrockConverseMessage{
+				Role:    role,
+				Content: []map[string]interface{}{{"text": m.Content}},
+			})
+		}
+
+		payloadMap := map[string]interface{}{
+			"messages": bMessages,
+		}
+		bPayload, err := json.Marshal(payloadMap)
+		if err != nil {
+			errChan <- err
+			return
+		}
+
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bPayload))
+		if err != nil {
+			errChan <- err
+			return
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+
+		if err := SignAWSBedrockRequest(httpReq, bPayload, p.region, p.accessKey, p.secretKey, ""); err != nil {
+			errChan <- err
+			return
+		}
+
+		resp, err := p.httpClient.Do(httpReq)
+		if err != nil {
+			errChan <- err
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusTooManyRequests {
+			errChan <- ErrProviderThrottled
+			return
+		}
+		if resp.StatusCode >= 500 {
+			errChan <- ErrProviderInternal
+			return
+		}
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			errChan <- fmt.Errorf("bedrock error %d: %s", resp.StatusCode, string(body))
+			return
+		}
+
+		// Read Bedrock stream lines
+		reader := bufio.NewReader(resp.Body)
+		for {
+			select {
+			case <-ctx.Done():
+				errChan <- ctx.Err()
+				return
+			default:
+			}
+
+			line, err := reader.ReadBytes('\n')
+			if err != nil {
+				if err != io.EOF {
+					errChan <- err
+				}
+				return
+			}
+
+			line = bytes.TrimSpace(line)
+			if len(line) == 0 {
+				continue
+			}
+
+			var payload bedrockConverseStreamPayload
+			if err := json.Unmarshal(line, &payload); err == nil {
+				if payload.ContentBlockDelta != nil && payload.ContentBlockDelta.Delta.Text != "" {
+					outChan <- models.StreamChunk{
+						ID:      chunkID,
+						Object:  "chat.completion.chunk",
+						Created: time.Now().Unix(),
+						Model:   p.modelID,
+						Choices: []models.StreamChoice{
+							{
+								Index: 0,
+								Delta: models.Delta{Content: payload.ContentBlockDelta.Delta.Text},
+							},
+						},
+					}
+				}
+				if payload.MessageStop != nil {
+					outChan <- models.StreamChunk{
+						ID:      chunkID,
+						Object:  "chat.completion.chunk",
+						Created: time.Now().Unix(),
+						Model:   p.modelID,
+						Choices: []models.StreamChoice{
+							{
+								Index:        0,
+								FinishReason: "stop",
+							},
+						},
+					}
+					return
+				}
+			}
+		}
 	}()
 
 	return outChan, errChan

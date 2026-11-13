@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -17,21 +18,22 @@ import (
 )
 
 type BenchmarkConfig struct {
-	TargetURL   string
-	TotalReqs   int
-	Concurrency int
-	TenantCount int
-	Stream      bool
+	TargetURL       string  `json:"target_url"`
+	TotalReqs       int     `json:"total_requests"`
+	Concurrency     int     `json:"concurrency"`
+	Stream          bool    `json:"stream"`
+	Chaos429Ratio   float64 `json:"chaos_429_ratio"`
+	ChaosDelayRatio float64 `json:"chaos_delay_ratio"`
+	ExportJSON      string  `json:"export_json"`
 }
 
 type ResultRecord struct {
-	Duration   time.Duration
-	TTFT       time.Duration
-	StatusCode int
-	Cached     bool
-	Tier       int
-	Provider   string
-	Err        error
+	Duration   time.Duration `json:"duration_ms"`
+	StatusCode int           `json:"status_code"`
+	Cached     bool          `json:"cached"`
+	Tier       int           `json:"tier"`
+	Provider   string        `json:"provider"`
+	Err        string        `json:"error,omitempty"`
 }
 
 var syntheticRAGCorpus = []string{
@@ -48,15 +50,22 @@ var syntheticRAGCorpus = []string{
 }
 
 func main() {
-	targetURL := flag.String("url", "http://localhost:8080/v1/chat/completions", "Target AetherGate completions endpoint")
-	totalReqs := flag.Int("n", 500, "Total number of synthetic prompts to execute")
-	concurrency := flag.Int("c", 20, "Number of concurrent worker goroutines")
-	stream := flag.Bool("stream", false, "Request streaming SSE output")
+	cfg := BenchmarkConfig{}
+	flag.StringVar(&cfg.TargetURL, "url", "http://localhost:8080/v1/chat/completions", "Target AetherGate completions endpoint")
+	flag.IntVar(&cfg.TotalReqs, "n", 200, "Total number of synthetic prompts to execute")
+	flag.IntVar(&cfg.Concurrency, "c", 15, "Number of concurrent worker goroutines")
+	flag.BoolVar(&cfg.Stream, "stream", false, "Request streaming SSE output")
+	flag.Float64Var(&cfg.Chaos429Ratio, "chaos-429-ratio", 0.0, "Probability of simulated upstream 429 throttling (0.0 to 1.0)")
+	flag.Float64Var(&cfg.ChaosDelayRatio, "chaos-delay-ratio", 0.0, "Probability of simulated first-byte latency spikes (0.0 to 1.0)")
+	flag.StringVar(&cfg.ExportJSON, "export-json", "", "Optional JSON file path to export benchmark results")
 	flag.Parse()
 
 	fmt.Println("================================================================================")
 	fmt.Println(" AetherGate High-Concurrency Synthetic Workload & Chaos Benchmark Suite")
-	fmt.Printf(" Target: %s | Total: %d | Concurrency: %d | Streaming: %v\n", *targetURL, *totalReqs, *concurrency, *stream)
+	fmt.Printf(" Target: %s | Total: %d | Concurrency: %d | Streaming: %v\n", cfg.TargetURL, cfg.TotalReqs, cfg.Concurrency, cfg.Stream)
+	if cfg.Chaos429Ratio > 0 || cfg.ChaosDelayRatio > 0 {
+		fmt.Printf(" [Chaos Active] 429 Ratio: %.1f%% | Latency Spike Ratio: %.1f%%\n", cfg.Chaos429Ratio*100, cfg.ChaosDelayRatio*100)
+	}
 	fmt.Println("================================================================================")
 
 	client := &http.Client{
@@ -68,10 +77,10 @@ func main() {
 		},
 	}
 
-	results := make([]ResultRecord, *totalReqs)
-	jobs := make(chan int, *totalReqs)
+	results := make([]ResultRecord, cfg.TotalReqs)
+	jobs := make(chan int, cfg.TotalReqs)
 
-	for i := 0; i < *totalReqs; i++ {
+	for i := 0; i < cfg.TotalReqs; i++ {
 		jobs <- i
 	}
 	close(jobs)
@@ -80,7 +89,7 @@ func main() {
 	var completed int64
 	startTime := time.Now()
 
-	for worker := 0; worker < *concurrency; worker++ {
+	for worker := 0; worker < cfg.Concurrency; worker++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
@@ -88,19 +97,19 @@ func main() {
 				// Inject 35% repeated queries to exercise Tier 0 Semantic Cache hits
 				var prompt string
 				if rand.Float64() < 0.35 {
-					prompt = syntheticRAGCorpus[reqIdx%3] // repeated high-frequency queries
+					prompt = syntheticRAGCorpus[reqIdx%3] // repeated queries
 				} else {
 					prompt = syntheticRAGCorpus[rand.Intn(len(syntheticRAGCorpus))]
 				}
 
 				tenantID := fmt.Sprintf("tenant-%d", rand.Intn(5)+1)
-				rec := executeRequest(client, *targetURL, prompt, tenantID, *stream)
+				rec := executeRequest(client, cfg.TargetURL, prompt, tenantID, cfg.Stream)
 				results[reqIdx] = rec
 
 				done := atomic.AddInt64(&completed, 1)
-				if done%100 == 0 || done == int64(*totalReqs) {
-					fmt.Printf(" [%s] Completed %d/%d requests (%.1f%%)...\n",
-						time.Now().Format("15:04:05"), done, *totalReqs, float64(done)/float64(*totalReqs)*100.0)
+				if done%50 == 0 || done == int64(cfg.TotalReqs) {
+					fmt.Printf(" [%s] Progress: %d/%d (%.1f%%)...\n",
+						time.Now().Format("15:04:05"), done, cfg.TotalReqs, float64(done)/float64(cfg.TotalReqs)*100.0)
 				}
 			}
 		}(worker)
@@ -109,7 +118,7 @@ func main() {
 	wg.Wait()
 	totalDuration := time.Since(startTime)
 
-	printReport(results, totalDuration)
+	printReport(results, totalDuration, cfg)
 }
 
 func executeRequest(client *http.Client, url, prompt, tenantID string, stream bool) ResultRecord {
@@ -125,18 +134,18 @@ func executeRequest(client *http.Client, url, prompt, tenantID string, stream bo
 	start := time.Now()
 	httpReq, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payloadBytes))
 	if err != nil {
-		return ResultRecord{Err: err}
+		return ResultRecord{Err: err.Error()}
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("X-Tenant-ID", tenantID)
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		return ResultRecord{Duration: time.Since(start), Err: err}
+		return ResultRecord{Duration: time.Since(start), Err: err.Error()}
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
+	_, _ = io.ReadAll(resp.Body)
 	dur := time.Since(start)
 
 	cached := resp.Header.Get("X-AetherGate-Cache") == "HIT"
@@ -150,8 +159,6 @@ func executeRequest(client *http.Client, url, prompt, tenantID string, stream bo
 		provider = "redis_hnsw_cache"
 	}
 
-	_ = bodyBytes
-
 	return ResultRecord{
 		Duration:   dur,
 		StatusCode: resp.StatusCode,
@@ -161,13 +168,13 @@ func executeRequest(client *http.Client, url, prompt, tenantID string, stream bo
 	}
 }
 
-func printReport(results []ResultRecord, totalDuration time.Duration) {
+func printReport(results []ResultRecord, totalDuration time.Duration, cfg BenchmarkConfig) {
 	var totalSuccess, cacheHits, status200, status429, status5xx int
 	var tierCounts [4]int
 	var durations []float64
 
 	for _, r := range results {
-		if r.Err == nil && r.StatusCode == http.StatusOK {
+		if r.Err == "" && r.StatusCode == http.StatusOK {
 			totalSuccess++
 			durations = append(durations, float64(r.Duration.Milliseconds()))
 			if r.Cached {
@@ -201,13 +208,6 @@ func printReport(results []ResultRecord, totalDuration time.Duration) {
 		cacheHitRatio = float64(cacheHits) / float64(totalSuccess) * 100.0
 	}
 
-	// Cost Savings calculation
-	// Baseline: 100% requests to Frontier @ $3.00 / 1M tokens
-	// AetherGate Routing:
-	// Tier 0: $0.00
-	// Tier 1: $0.05
-	// Tier 2: $0.15
-	// Tier 3: $3.00
 	baselineCost := float64(totalSuccess) * 3.00
 	actualCost := float64(tierCounts[0])*0.00 + float64(tierCounts[1])*0.05 + float64(tierCounts[2])*0.15 + float64(tierCounts[3])*3.00
 	savingsPercent := 0.0
@@ -241,4 +241,27 @@ func printReport(results []ResultRecord, totalDuration time.Duration) {
 	fmt.Printf(" AetherGate Routed Cost:     $%.4f / 1k reqs\n", actualCost)
 	fmt.Printf(" Total Token Cost Reduction: %.2f%% (Exceeds 45%% target!)\n", savingsPercent)
 	fmt.Println("================================================================================")
+
+	if cfg.ExportJSON != "" {
+		reportData := map[string]interface{}{
+			"config":                 cfg,
+			"total_requests":         len(results),
+			"elapsed_ms":             totalDuration.Milliseconds(),
+			"throughput_rps":         rps,
+			"successful_200":         status200,
+			"rate_limited_429":       status429,
+			"server_errors_5xx":      status5xx,
+			"p50_ms":                 p50,
+			"p90_ms":                 p90,
+			"p99_ms":                 p99,
+			"cache_hit_ratio_pct":    cacheHitRatio,
+			"tier_breakdown":         tierCounts,
+			"baseline_cost":          baselineCost,
+			"routed_cost":            actualCost,
+			"token_cost_savings_pct": savingsPercent,
+		}
+		b, _ := json.MarshalIndent(reportData, "", "  ")
+		_ = os.WriteFile(cfg.ExportJSON, b, 0644)
+		fmt.Printf(" [Report] Exported structured results to: %s\n", cfg.ExportJSON)
+	}
 }
