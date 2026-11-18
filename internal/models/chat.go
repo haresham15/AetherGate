@@ -78,9 +78,13 @@ func (r *ChatCompletionRequest) EstimateTokens() int {
 	if estimated < 4 {
 		estimated = 4
 	}
-	// Add estimated max tokens if set, or reasonable default
+	// Add estimated max tokens if set, bounded to prevent arithmetic overflow
 	if r.MaxTokens != nil && *r.MaxTokens > 0 {
-		estimated += *r.MaxTokens / 4
+		maxTok := *r.MaxTokens
+		if maxTok > 1000000 {
+			maxTok = 1000000
+		}
+		estimated += maxTok / 4
 	}
 	return estimated
 }

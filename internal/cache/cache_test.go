@@ -10,6 +10,25 @@ import (
 	"github.com/aethergate/aethergate/internal/models"
 )
 
+func TestEscapeRediSearchTag(t *testing.T) {
+	// Attempt query injection breakout payloads
+	malicious := "evil_tenant} | @tenant_id:{*"
+	escaped := EscapeRediSearchTag(malicious)
+
+	expected := `evil_tenant\}\ \|\ \@tenant_id\:\{\*`
+	if escaped != expected {
+		t.Fatalf("expected escaped tag %q, got %q", expected, escaped)
+	}
+
+	// Normal alphanumeric
+	normal := "tenant-prod_123"
+	escapedNormal := EscapeRediSearchTag(normal)
+	expectedNormal := `tenant\-prod_123`
+	if escapedNormal != expectedNormal {
+		t.Fatalf("expected escaped tag %q, got %q", expectedNormal, escapedNormal)
+	}
+}
+
 func TestFloat32BytesConversion(t *testing.T) {
 	vec := []float32{0.1234, -0.5678, 0.9999, 0.0, -1.0}
 	bytes := Float32ToBytes(vec)

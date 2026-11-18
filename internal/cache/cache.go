@@ -74,6 +74,25 @@ func BytesToFloat32(buf []byte) []float32 {
 	return vec
 }
 
+// EscapeRediSearchTag escapes all special characters in RediSearch TAG queries
+// to prevent query injection and cross-tenant data leakage.
+// Special characters in RediSearch: , . < > { } [ ] " ' : ; ! @ # $ % ^ & * ( ) - + = ~ | / \
+func EscapeRediSearchTag(s string) string {
+	var sb strings.Builder
+	for _, r := range s {
+		switch r {
+		case ',', '.', '<', '>', '{', '}', '[', ']', '"', '\'', ':', ';',
+			'!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '-', '+', '=',
+			'~', '|', '/', '\\', ' ':
+			sb.WriteRune('\\')
+			sb.WriteRune(r)
+		default:
+			sb.WriteRune(r)
+		}
+	}
+	return sb.String()
+}
+
 // HashSystemPrompt produces a compact SHA256 hex string of the system prompt to prevent cross-persona pollution.
 func HashSystemPrompt(systemPrompt string) string {
 	if systemPrompt == "" {
@@ -156,12 +175,16 @@ func (s *RedisSemanticCache) Lookup(ctx context.Context, tenantID, systemHash st
 		systemHash = "none"
 	}
 
+	// Sanitize and escape tag parameters to prevent RediSearch query injection
+	safeTenant := EscapeRediSearchTag(tenantID)
+	safeHash := EscapeRediSearchTag(systemHash)
+
 	// Scoped KNN query using dialect 2
 	var filter string
 	if modelTier > 0 {
-		filter = fmt.Sprintf("(@tenant_id:{%s} @system_hash:{%s} @model_tier:[%d %d])", tenantID, systemHash, modelTier, modelTier)
+		filter = fmt.Sprintf("(@tenant_id:{%s} @system_hash:{%s} @model_tier:[%d %d])", safeTenant, safeHash, modelTier, modelTier)
 	} else {
-		filter = fmt.Sprintf("(@tenant_id:{%s} @system_hash:{%s})", tenantID, systemHash)
+		filter = fmt.Sprintf("(@tenant_id:{%s} @system_hash:{%s})", safeTenant, safeHash)
 	}
 	query := fmt.Sprintf("%s=>[KNN 1 @embedding $blob AS dist]", filter)
 

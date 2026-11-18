@@ -22,13 +22,18 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /bin/mock-upstream ./d
 # Final Minimal Distroless / Alpine Runtime
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates tzdata curl
+RUN apk add --no-cache ca-certificates tzdata curl && \
+    addgroup -S -g 10001 aethergate && \
+    adduser -S -u 10001 -G aethergate aethergate
 
 WORKDIR /app
 
 COPY --from=builder /bin/aethergate /usr/local/bin/aethergate
 COPY --from=builder /bin/benchmark /usr/local/bin/benchmark
 COPY --from=builder /bin/mock-upstream /usr/local/bin/mock-upstream
+
+# Enforce least privilege by running as non-root user
+USER 10001:10001
 
 EXPOSE 8080
 

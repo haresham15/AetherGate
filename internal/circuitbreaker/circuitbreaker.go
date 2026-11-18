@@ -185,6 +185,9 @@ func (cb *SlidingWindowCircuitBreaker) trip() {
 func (cb *SlidingWindowCircuitBreaker) record(failed bool, ttftMs int64) {
 	nowSec := time.Now().Unix()
 	idx := int(nowSec % int64(cb.config.WindowSeconds))
+	if idx < 0 {
+		idx = -idx
+	}
 
 	cb.mu.Lock()
 	defer cb.mu.Unlock()

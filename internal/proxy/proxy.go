@@ -20,9 +20,10 @@ import (
 )
 
 const (
-	FirstByteDeadline = 1500 * time.Millisecond
-	DefaultTenantRPM  = 600.0   // 600 requests per minute
-	DefaultTenantTPM  = 500000.0 // 500k tokens per minute
+	FirstByteDeadline   = 1500 * time.Millisecond
+	DefaultTenantRPM    = 600.0                // 600 requests per minute
+	DefaultTenantTPM    = 500000.0             // 500k tokens per minute
+	MaxRequestBodyBytes = 10 * 1024 * 1024     // 10 MB maximum request payload
 )
 
 // GatewayConfig holds configuration for the AetherGate reverse proxy.
@@ -106,13 +107,20 @@ func (p *ResilientProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// ------------------------------------------------------------------------
 	// Stage 1: Ingress & Tenant Rate Limiting
 	// ------------------------------------------------------------------------
-	tenantID := extractTenant(r)
+	tenantID := p.extractTenant(r)
+
+	// Guard against memory exhaustion DoS by bounding request body to MaxRequestBodyBytes (10MB)
+	r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBodyBytes)
 
 	// Decode request body
 	var req models.ChatCompletionRequest
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		if strings.Contains(err.Error(), "request body too large") {
+			http.Error(w, "Request body exceeds 10MB payload limit", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "Failed to read request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
@@ -483,20 +491,50 @@ func (p *ResilientProxy) handleNonStreamingProxy(
 	}
 }
 
-func extractTenant(r *http.Request) string {
-	if t := r.Header.Get("X-Tenant-ID"); t != "" {
-		return t
-	}
+func (p *ResilientProxy) extractTenant(r *http.Request) string {
 	auth := r.Header.Get("Authorization")
+	var token string
 	if strings.HasPrefix(auth, "Bearer ") {
-		token := strings.TrimPrefix(auth, "Bearer ")
+		token = strings.TrimPrefix(auth, "Bearer ")
+	}
+
+	// If explicit tenant header is passed, sanitize to prevent injection or directory pathing
+	if t := r.Header.Get("X-Tenant-ID"); t != "" {
+		sanitized := sanitizeIdentifier(t)
+		if sanitized != "" {
+			return sanitized
+		}
+	}
+
+	if token != "" {
 		parts := strings.Split(token, "-")
 		if len(parts) > 1 {
-			return parts[0]
+			sanitized := sanitizeIdentifier(parts[0])
+			if sanitized != "" {
+				return sanitized
+			}
 		}
-		return token
+		sanitized := sanitizeIdentifier(token)
+		if sanitized != "" {
+			return sanitized
+		}
 	}
 	return "default-tenant"
+}
+
+// sanitizeIdentifier restricts strings to safe alphanumeric and delimiter characters [a-zA-Z0-9_.-]
+// with a maximum length of 64 characters to eliminate command/query injection attacks.
+func sanitizeIdentifier(s string) string {
+	var sb strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+			sb.WriteRune(r)
+		}
+		if sb.Len() >= 64 {
+			break
+		}
+	}
+	return sb.String()
 }
 
 func secondaryName(s Provider) string {

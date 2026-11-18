@@ -30,6 +30,30 @@ func setupTestProxy() (*ResilientProxy, *cache.MemorySemanticCache, *telemetry.M
 	return proxy, c, m
 }
 
+func TestProxySecurityHardening(t *testing.T) {
+	proxy, _, _ := setupTestProxy()
+	mockP := NewMockProvider("mock-vllm", router.Tier1LocalFast)
+	proxy.RegisterProvider(mockP)
+
+	// 1. Test oversized payload (DoS mitigation)
+	oversizedBody := make([]byte, 11*1024*1024) // 11 MB > 10 MB limit
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(oversizedBody))
+	httpReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	proxy.ServeHTTP(w, httpReq)
+	if w.Code != http.StatusRequestEntityTooLarge && w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 413 or 400 for oversized body, got %d", w.Code)
+	}
+
+	// 2. Test tenant ID sanitization
+	evilTenant := "evil/../../tenant-id;DROP TABLE;--\x00"
+	sanitized := sanitizeIdentifier(evilTenant)
+	if strings.Contains(sanitized, "/") || strings.Contains(sanitized, ";") || strings.Contains(sanitized, " ") {
+		t.Fatalf("sanitizer failed to strip dangerous characters: %q", sanitized)
+	}
+}
+
 func TestProxyStreamingSuccess(t *testing.T) {
 	proxy, _, _ := setupTestProxy()
 
